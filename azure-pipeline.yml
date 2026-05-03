@@ -1,0 +1,168 @@
+trigger: none
+
+parameters:
+- name: pullRequestId
+  displayName: 'Pull Request ID (for manual run; leave 0 for PR-triggered runs)'
+  type: number
+  default: 0
+
+pool:
+  vmImage: ubuntu-latest
+
+# AZURE_DEVOPS_PAT and GITHUB_TOKEN must be set as secret pipeline variables
+# (Code: Read, Pull Request Threads: Read & Write for PAT; Copilot access for GitHub token)
+
+steps:
+- checkout: self
+  persistCredentials: true
+  fetchDepth: 0
+
+- task: Bash@3
+  displayName: 'Install GitHub Copilot CLI'
+  inputs:
+    targetType: 'inline'
+    script: |
+      if ! command -v copilot &> /dev/null; then
+        echo "Copilot CLI not found. Installing..."
+        curl -fsSL https://gh.io/copilot-install | bash
+      else
+        echo "Copilot CLI already installed: $(copilot --version)"
+      fi
+  env:
+    GITHUB_TOKEN: $(GITHUB_TOKEN)
+
+- task: PowerShell@2
+  displayName: 'Resolve PR Details'
+  inputs:
+    targetType: 'inline'
+    pwsh: true
+    script: |
+      $paramPrId = ${{ parameters.pullRequestId }}
+      $org = ("$(System.CollectionUri)" -split "/" | Select-Object -Index 3)
+
+      if ($paramPrId -gt 0) {
+        # Manual run: fetch PR details from Azure DevOps API
+        Write-Host "Manual run detected. Fetching PR #$paramPrId from org '$org'..."
+        $base64Pat = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$env:AZURE_DEVOPS_PAT"))
+        $headers = @{
+          Authorization = "Basic $base64Pat"
+          "Content-Type" = "application/json"
+        }
+
+        # Search for PR across all projects/repos in the org
+        $prUrl = "https://dev.azure.com/$org/_apis/git/pullrequests/$($paramPrId)?api-version=7.1"
+        $pr = Invoke-RestMethod -Uri $prUrl -Headers $headers -Method Get
+
+        $sourceBranch = $pr.sourceRefName
+        $targetBranch = $pr.targetRefName
+        $project      = $pr.repository.project.name
+        $repoName     = $pr.repository.name
+        $prId         = $pr.pullRequestId
+      }
+      else {
+        # PR-triggered run: use built-in variables
+        Write-Host "PR-triggered run detected."
+        $sourceBranch = "$(System.PullRequest.SourceBranch)"
+        $targetBranch = "$(System.PullRequest.TargetBranch)"
+        $project      = "$(System.TeamProject)"
+        $repoName     = "$(Build.Repository.Name)"
+        $prId         = $(System.PullRequest.PullRequestId)
+
+        if ([string]::IsNullOrWhiteSpace($prId)) { throw "System.PullRequest.PullRequestId is not set. Ensure this pipeline runs as a PR build validation." }
+      }
+
+      Write-Host "Source: $sourceBranch | Target: $targetBranch | PR: $prId | Project: $project | Repo: $repoName"
+
+      # Export as pipeline variables for next step
+      Write-Host "##vso[task.setvariable variable=PrSourceBranch]$sourceBranch"
+      Write-Host "##vso[task.setvariable variable=PrTargetBranch]$targetBranch"
+      Write-Host "##vso[task.setvariable variable=PrProject]$project"
+      Write-Host "##vso[task.setvariable variable=PrRepoName]$repoName"
+      Write-Host "##vso[task.setvariable variable=PrId]$prId"
+      Write-Host "##vso[task.setvariable variable=PrOrg]$org"
+  env:
+    AZURE_DEVOPS_PAT: $(AZURE_DEVOPS_PAT)
+
+- task: PowerShell@2
+  displayName: 'Clone PR Repository'
+  condition: and(succeeded(), ne('${{ parameters.pullRequestId }}', '0'))
+  inputs:
+    targetType: 'inline'
+    pwsh: true
+    script: |
+      $org      = "$(PrOrg)"
+      $project  = "$(PrProject)"
+      $repoName = "$(PrRepoName)"
+
+      $cloneDir = Join-Path "$(Agent.TempDirectory)" "pr-repo"
+      if (Test-Path $cloneDir) { Remove-Item -Recurse -Force $cloneDir }
+
+      # Clone using header-based auth (PAT not in URL)
+      $encodedProject  = [Uri]::EscapeDataString($project)
+      $encodedRepoName = [Uri]::EscapeDataString($repoName)
+      $cloneUrl = "https://dev.azure.com/$org/$encodedProject/_git/$encodedRepoName"
+      $base64Pat = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$($env:AZURE_DEVOPS_PAT)"))
+      Write-Host "Cloning $org/$project/$repoName into $cloneDir..."
+      git -c "http.extraheader=Authorization: Basic $base64Pat" clone $cloneUrl $cloneDir
+      if ($LASTEXITCODE -ne 0) { throw "git clone failed" }
+
+      Push-Location $cloneDir
+
+      # Set auth header for subsequent git commands
+      git config http.extraheader "Authorization: Basic $base64Pat"
+
+      # Fetch source and target branches
+      $source = "$(PrSourceBranch)" -replace 'refs/heads/', ''
+      $target = "$(PrTargetBranch)" -replace 'refs/heads/', ''
+
+      Write-Host "Fetching branches: $source, $target"
+      git fetch origin "$($source):refs/remotes/origin/$source" "$($target):refs/remotes/origin/$target"
+      if ($LASTEXITCODE -ne 0) { throw "git fetch failed" }
+
+      Pop-Location
+
+      Write-Host "##vso[task.setvariable variable=PrRepoDir]$cloneDir"
+  env:
+    AZURE_DEVOPS_PAT: $(AZURE_DEVOPS_PAT)
+
+- task: PowerShell@2
+  displayName: 'Set Repo Dir for PR-triggered runs'
+  condition: and(succeeded(), eq('${{ parameters.pullRequestId }}', '0'))
+  inputs:
+    targetType: 'inline'
+    pwsh: true
+    script: |
+      # PR-triggered: checkout: self already has correct repo
+      Write-Host "##vso[task.setvariable variable=PrRepoDir]$(Build.SourcesDirectory)"
+
+- task: PowerShell@2
+  displayName: 'Copilot Code Review'
+  inputs:
+    targetType: 'inline'
+    pwsh: true
+    script: |
+      . ./AZCopilotCodeReview/Get-CodeChanges.ps1
+      . ./AZCopilotCodeReview/Invoke-CopilotCodeReview.ps1
+      . ./AZCopilotCodeReview/Set-PullRequestComments.ps1
+
+      $reviewParams = @{
+        SourceBranch     = "$(PrSourceBranch)"
+        TargetBranch     = "$(PrTargetBranch)"
+        PathToReviewFile = './AZCopilotCodeReview/Generic.codereviewprompt.md'
+        GitHubToken      = $env:GITHUB_TOKEN
+        RepoPath         = "$(PrRepoDir)"
+      }
+      [string]$reviews = Invoke-CopilotCodeReview @reviewParams
+
+      $commentParams = @{
+        Organization   = "$(PrOrg)"
+        PullRequestId  = [int]"$(PrId)"
+        Project        = "$(PrProject)"
+        RepositoryName = "$(PrRepoName)"
+        AzureDevOpsPat = $env:AZURE_DEVOPS_PAT
+        Reviews        = $reviews
+      }
+      Set-PullRequestComments @commentParams
+  env:
+    GITHUB_TOKEN: $(GITHUB_TOKEN)
+    AZURE_DEVOPS_PAT: $(AZURE_DEVOPS_PAT)
