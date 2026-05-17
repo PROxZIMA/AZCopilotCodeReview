@@ -28,6 +28,7 @@ Automated code review pipeline for Azure DevOps pull requests using GitHub Copil
 - [x] Pull request comment threading to group related comments
 - [x] Minimal git diff context to stay within token limits
 - [x] Simple configuration with Manual Trigger for Specific PR & Build Validation Trigger (no IT approval for ADO extensions)
+- [x] Supports larger PRs code context
 
 ## Todo
 - [ ] Support Azure DevOps pipeline's built-in System Access Token

@@ -61,12 +61,16 @@ $changes
     try {
         Write-Host "Sending code changes to Copilot CLI (claude-sonnet-4.6) for review..."
 
-        # Call Copilot CLI with Claude Sonnet 4.6
-        $result = copilot --model claude-sonnet-4.6 --prompt $fullPrompt
+        # For large prompts, write to temp file and pipe to Copilot CLI
+        $tempFile = New-TemporaryFile
+        $fullPrompt | Out-File -LiteralPath $tempFile.FullName -Encoding UTF8 -NoNewline
+        $result = Get-Content -LiteralPath $tempFile.FullName -Raw | copilot --model claude-sonnet-4.6
 
         if ($LASTEXITCODE -ne 0) {
             throw "Copilot CLI failed with exit code $LASTEXITCODE. Output: $result"
         }
+
+        Remove-Item -LiteralPath $tempFile.FullName -Force -ErrorAction SilentlyContinue
 
         # CLI returns array of lines — join to single string
         $result = ($result | Out-String).Trim()
